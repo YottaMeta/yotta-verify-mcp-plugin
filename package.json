@@ -1,0 +1,32 @@
+{
+  "name": "@yottameta/yotta-verify-mcp-plugin",
+  "version": "0.2.3",
+  "description": "YuanXinMCP (元信MCP) — pre-install security scanning for Agent skills, packaged as a YottaMeta Agent Plugin.",
+  "license": "MIT",
+  "keywords": [
+    "yottameta",
+    "agent-plugins",
+    "agent-skills",
+    "mcp",
+    "yotta-verify-mcp"
+  ],
+  "homepage": "https://github.com/YottaMeta/yotta-verify-mcp-plugin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YottaMeta/yotta-verify-mcp-plugin.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "plugin.json",
+    "mcp.json",
+    "skills",
+    ".agents",
+    ".claude-plugin",
+    "README.md",
+    "LICENSE",
+    "!**/__pycache__/**",
+    "!**/*.pyc"
+  ]
+}

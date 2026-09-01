@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "yotta-verify-mcp": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "${PLUGIN_ROOT}/skills/yotta-verify-mcp/scripts/yotta_verify_mcp.py"
+      ]
+    }
+  }
+}
