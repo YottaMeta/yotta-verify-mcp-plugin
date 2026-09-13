@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "yotta-verify-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "YuanXinMCP (元信MCP) - the pre-install security scanner for Agent skills, exposed as a stdio MCP server: scan_skill (dir/package -> verdict + findings), generate_badge (audited badge), gate_check (CI gate), get_report (JSON/Markdown). Local offline static scan; no upload of scanned content, no execution of scanned code; human confirmation required.",
   "author": {
     "name": "YottaMeta",
