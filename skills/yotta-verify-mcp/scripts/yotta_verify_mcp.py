@@ -27,7 +27,7 @@ sys.path.insert(0, str(_HERE))
 
 import yotta_verify as yv  # noqa: E402
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 TOOL_NAME = "yotta-verify-mcp"
 CN_NAME = "元信"
 MCP_PROTOCOL_MODERN = "2026-07-28"
@@ -43,10 +43,6 @@ def _tool_error(message, extra=None):
         payload.update(extra)
     return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
             "isError": True}
-
-
-def _name_hint(path):
-    return Path(path).name
 
 
 def _resolve_target(target, tmp_dirs):
@@ -77,7 +73,7 @@ def _scan(target):
     tmp_dirs = []
     try:
         path = _resolve_target(target, tmp_dirs)
-        findings, counts, verdict, meta = yv.scan_core(path, name_hint=_name_hint(path))
+        findings, counts, verdict, meta = yv.scan_core(path, auto_name_hint=True)
         return findings, counts, verdict, meta, None
     except SystemExit as e:
         return None, None, None, None, str(e)

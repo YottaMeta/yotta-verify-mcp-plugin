@@ -52,7 +52,7 @@ sys.path.insert(0, str(_HERE))
 import verify_rules  # noqa: E402
 import threat_engine  # noqa: E402
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 TOOL_NAME = "yotta-verify"
 CN_NAME = "元信"
 
@@ -436,6 +436,8 @@ def downgrade_detector_docs(findings, root):
     if not is_detector_skill(root):
         return
     for f in findings:
+        if f.detector == "Structure":
+            continue
         if f.severity in ("critical", "high", "medium"):
             if Path(f.file_path).suffix.lower() in _DOC_EXT:
                 f.severity = "info"
@@ -492,19 +494,71 @@ def exit_code_of(verdict):
 # ── 扫描主流程 ─────────────────────────────────────────────────────────────
 
 def _safe_extract(tf, dest):
-    """提取 tarball（Python 3.8 兼容；手工路径穿越防护）。"""
+    """提取 tarball（Python 3.8 兼容；拒绝路径穿越、链接与特殊文件）。"""
+    safe_members = []
+    root = Path(dest).resolve()
     for member in tf.getmembers():
-        name = member.name
-        if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+        name = member.name.replace("\\", "/")
+        drive_path = len(name) >= 2 and name[1] == ":" and name[0].isalpha()
+        if (not name or name.startswith("/") or drive_path
+                or any(part == ".." for part in name.split("/"))):
             raise ValueError("tarball 含危险路径: %s" % name)
-    tf.extractall(dest)
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+            raise ValueError("tarball 含链接或特殊文件成员: %s" % member.name)
+        parts = [part for part in name.split("/") if part not in ("", ".")]
+        target = root.joinpath(*parts).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise ValueError("tarball 成员越出临时目录: %s" % member.name)
+        member.mode = member.mode & 0o777
+        safe_members.append(member)
+    if sys.version_info >= (3, 12):
+        tf.extractall(dest, members=safe_members, filter="data")
+    else:
+        tf.extractall(dest, members=safe_members)
 
 
-def scan_core(target, name_hint=None):
+def _package_slug_from_root(root):
+    """从包根 package.json 读取 npm 包名并归一为技能 slug。"""
+    try:
+        data = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    name = data.get("name") if isinstance(data, dict) else None
+    if not isinstance(name, str):
+        return None
+    slug = name.strip().rsplit("/", 1)[-1]
+    if not slug or slug in (".", "..") or "/" in slug or "\\" in slug:
+        return None
+    return slug
+
+
+def resolve_name_hint(target, root, from_archive=False):
+    """解析 STR-004 的期望名称：安装目录用目录名，npm 包输入用包名。"""
+    if from_archive:
+        package_root = root / "package"
+        if package_root.is_dir():
+            root = package_root
+        slug = _package_slug_from_root(root)
+        if slug:
+            return slug
+        return Path(target).name
+    if root.name == "package":
+        slug = _package_slug_from_root(root)
+        if slug:
+            return slug
+        return root.name
+    return root.name
+
+
+def scan_core(target, name_hint=None, auto_name_hint=False):
     """扫描目录/tarball，返回 (findings, counts, verdict, scan_meta)。"""
     tmpdir = None
     root = Path(target)
+    from_archive = False
     if root.is_file() and str(root).lower().endswith((".tgz", ".tar.gz")):
+        from_archive = True
         tmpdir = tempfile.mkdtemp(prefix="yotta-verify-")
         with tarfile.open(str(root), "r:gz") as tf:
             _safe_extract(tf, tmpdir)
@@ -514,6 +568,8 @@ def scan_core(target, name_hint=None):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
         raise SystemExit("目标不存在或不是目录: %s" % target)
+    if auto_name_hint and name_hint is None:
+        name_hint = resolve_name_hint(target, root, from_archive=from_archive)
     files = walk_files(root)
     findings = scan_patterns(files)
     check_skill_integrity(root, findings, name_hint)
@@ -748,12 +804,8 @@ def shields_url(verdict):
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
-def _name_hint(target):
-    return Path(target).name
-
-
 def cmd_scan(args):
-    findings, counts, verdict, meta = scan_core(args.path, name_hint=_name_hint(args.path))
+    findings, counts, verdict, meta = scan_core(args.path, auto_name_hint=True)
     code = exit_code_of(verdict)
     # gate 模式
     if args.max_severity:
@@ -801,7 +853,7 @@ def cmd_badge(args):
     }
     # 若给目录：先扫描拿 verdict；否则默认 SAFE
     if args.path and Path(args.path).exists():
-        findings, counts, verdict, meta = scan_core(args.path, name_hint=_name_hint(args.path))
+        findings, counts, verdict, meta = scan_core(args.path, auto_name_hint=True)
     else:
         verdict = VERDICT_SAFE
         counts = {s: 0 for s in _SEVERITY_ORDER}
@@ -815,7 +867,7 @@ def cmd_badge(args):
 
 
 def cmd_report(args):
-    findings, counts, verdict, meta = scan_core(args.path, name_hint=_name_hint(args.path))
+    findings, counts, verdict, meta = scan_core(args.path, auto_name_hint=True)
     if args.json:
         print(render_json(findings, counts, verdict, meta))
     else:
@@ -830,7 +882,7 @@ def cmd_report(args):
 
 
 def cmd_gate(args):
-    findings, counts, verdict, meta = scan_core(args.path, name_hint=_name_hint(args.path))
+    findings, counts, verdict, meta = scan_core(args.path, auto_name_hint=True)
     code = exit_code_of(verdict)
     limit = _SEVERITY_VALUE.get((args.max_severity or "medium").lower(), 1)
     worst = _SEVERITY_VALUE.get(verdict_worst(findings), 0)
