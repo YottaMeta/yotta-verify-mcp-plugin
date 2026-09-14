@@ -48,6 +48,12 @@ function findPython() {
 function main() {
   const args = process.argv.slice(2);
 
+  if (args.indexOf('--version') !== -1 || args.indexOf('-v') !== -1) {
+    const pkg = require(path.join(PKG_ROOT, 'package.json'));
+    process.stdout.write(pkg.version + '\n');
+    return;
+  }
+
   if (isInstallRequest(args)) {
     // 委托给安装器（install.js 读取自身 process.argv，检测到安装参数即执行）
     require(path.join(__dirname, 'install.js'));
