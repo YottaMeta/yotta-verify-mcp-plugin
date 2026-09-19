@@ -30,6 +30,7 @@ exit code 语义（与元安/元审一致）：
 """
 import argparse
 import base64
+import hashlib
 import json
 import re
 import sys
@@ -52,7 +53,7 @@ sys.path.insert(0, str(_HERE))
 import verify_rules  # noqa: E402
 import threat_engine  # noqa: E402
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 TOOL_NAME = "yotta-verify"
 CN_NAME = "元信"
 
@@ -74,8 +75,48 @@ DOTFILE_NAMES = {
 MAX_FILE_SIZE = 1_000_000
 MAX_LINE_LEN = verify_rules.MAX_LINE_LEN
 MAX_FILES = 2000
-# 签名数据文件：规则表是扫描器自身的签名数据库，不是被测技能行为，扫描时跳过
+# 签名数据文件：规则表是扫描器自身与家族检测技能的签名数据库，不是被测技能行为。
+# v0.3.2 收紧（旧行为 = 按文件名全局豁免，`scripts/<同名>.py` 可被随意伪造以逃避扫描）：
+#   ① 相对路径必须恰为 scripts/<规则表名>.py；
+#   ② 文件 SHA-256（CRLF 归一化）必须命中「已发布规则表摘要表」。
+# 任一条不满足 → 正常扫描（fail-closed），杜绝「改名即豁免」与「放标记文件即降级」。
 SIGNATURE_DATA_FILES = {"verify_rules.py", "audit_rules.py", "vetter_rules.py", "hardening_rules.py"}
+SIGNATURE_DATA_DIGESTS = {
+    "verify_rules.py": {"8d8c128911b05b24413cc3aec8a2d1c36c1ccf66f656330f723cd68718bda8bd"},
+    "vetter_rules.py": {"fc5bad6a7705f9fde60f4fdaf540a3aaa6490448d1fe22ed264e3f812c8ba092"},
+    "audit_rules.py": {"475ba1daee436589997260291917126218ae7cae572d16eb59459ca5a2192d23"},
+    "hardening_rules.py": {"6b9cbdaa106ae7f5827e60f83c016c237d4cd28785426930abc24cde00bcf5c7"},
+}
+
+
+def _sha256_normalized(path):
+    """CRLF 归一化后的 SHA-256（跨 Windows / Linux 检出结果一致）。"""
+    try:
+        data = path.read_bytes().replace(b"\r\n", b"\n")
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def is_signature_data(rel, path):
+    """是否为「已发布」的家族规则表：路径 + 内容摘要双绑定。"""
+    known = SIGNATURE_DATA_DIGESTS.get(path.name)
+    if not known:
+        return False
+    parts = str(rel).replace("\\", "/").split("/")
+    if len(parts) != 2 or parts[0] != "scripts":
+        return False
+    digest = _sha256_normalized(path)
+    return bool(digest) and digest in known
+
+
+def has_published_signature_data(root):
+    """目标包是否持有已发布签名数据（用于测试夹具跳过与文档降级判定）。"""
+    for name in SIGNATURE_DATA_DIGESTS:
+        p = Path(root) / "scripts" / name
+        if p.is_file() and is_signature_data("scripts/" + name, p):
+            return True
+    return False
 
 # ── 严重级 / verdict ───────────────────────────────────────────────────────
 _SEVERITY_VALUE = verify_rules.SEVERITY_VALUE
@@ -143,19 +184,26 @@ def is_text_file(name):
     return Path(p).suffix in TEXT_EXTENSIONS
 
 
-def walk_files(root, base=""):
-    """递归收集可扫描文本文件（跳过 SKIP_DIRS / 签名数据 / 超限）。"""
+def walk_files(root, base="", trusted_tests=None, scan_root=None):
+    """递归收集可扫描文本文件（跳过 SKIP_DIRS / 已发布签名数据 / 超限）。
+
+    trusted_tests 只在「目标包持有已发布签名数据」时为真——此时 `test_*.py`
+    视为自家测试夹具跳过；第三方包的同名文件照常扫描（v0.3.2 起）。
+    """
     out = []
+    if scan_root is None:
+        scan_root = root
+        trusted_tests = has_published_signature_data(scan_root)
     try:
         entries = sorted(root.iterdir())
     except OSError:
         return out
     for entry in entries:
-        if entry.name in SKIP_DIRS or entry.name in SIGNATURE_DATA_FILES:
+        if entry.name in SKIP_DIRS:
             continue
         rel = entry.name if not base else base + "/" + entry.name
         if entry.is_dir():
-            out.extend(walk_files(entry, rel))
+            out.extend(walk_files(entry, rel, trusted_tests, scan_root))
         elif entry.is_file():
             try:
                 size = entry.stat().st_size
@@ -163,8 +211,11 @@ def walk_files(root, base=""):
                 continue
             if size > MAX_FILE_SIZE:
                 continue
-            # 测试文件为签名/测试数据（含构造的恶意样例），非被测技能行为，跳过
-            if entry.name.startswith("test_") and entry.name.endswith(".py"):
+            # 已发布规则表（路径 + 摘要绑定）不是被测技能行为，跳过
+            if is_signature_data(rel, entry):
+                continue
+            # 自家包的测试夹具（含构造样例）跳过；第三方包不豁免
+            if trusted_tests and entry.name.startswith("test_") and entry.name.endswith(".py"):
                 continue
             if is_text_file(entry.name):
                 out.append((entry, rel))
@@ -420,11 +471,12 @@ _DOC_EXT = {".md", ".txt", ".markdown", ".rst"}
 
 
 def is_detector_skill(root):
-    """目标目录是否含检测器签名文件（audit_rules/verify_rules/vetter_rules/hardening_rules）。"""
-    for name in _DETECTOR_SIG_FILES:
-        if (root / name).is_file() or (root / "scripts" / name).is_file():
-            return True
-    return False
+    """目标是否为家族检测技能（v0.3.2：须持「已发布」规则表，路径 + 摘要绑定）。
+
+    旧行为 = 只看目录里有没有同名文件（放一个标记文件即可把整包文档命中降级为
+    info）。现改为内容摘要绑定：未验证的同名文件不构成检测器签名。
+    """
+    return has_published_signature_data(root)
 
 
 def downgrade_detector_docs(findings, root):
