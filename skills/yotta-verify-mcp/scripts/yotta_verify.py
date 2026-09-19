@@ -86,6 +86,7 @@ SIGNATURE_DATA_DIGESTS = {
     "vetter_rules.py": {"fc5bad6a7705f9fde60f4fdaf540a3aaa6490448d1fe22ed264e3f812c8ba092"},
     "audit_rules.py": {"475ba1daee436589997260291917126218ae7cae572d16eb59459ca5a2192d23"},
     "hardening_rules.py": {"6b9cbdaa106ae7f5827e60f83c016c237d4cd28785426930abc24cde00bcf5c7"},
+    "guardian_rules.py": {"a9fc0da3e0344d485b20c55378b58bc81d78ecbb28a7f2b3bd44bcbed06aebe3"},
 }
 
 
