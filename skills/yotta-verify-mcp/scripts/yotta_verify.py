@@ -53,7 +53,7 @@ sys.path.insert(0, str(_HERE))
 import verify_rules  # noqa: E402
 import threat_engine  # noqa: E402
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 TOOL_NAME = "yotta-verify"
 CN_NAME = "元信"
 
@@ -75,6 +75,20 @@ DOTFILE_NAMES = {
 MAX_FILE_SIZE = 1_000_000
 MAX_LINE_LEN = verify_rules.MAX_LINE_LEN
 MAX_FILES = 2000
+# v0.4.4：不可静态分析的可执行 / 二进制载荷不再静默跳过（fail-closed）。
+# 旧行为只对 TEXT_EXTENSIONS 做内容分析，`.exe` / `.dll` / `.jar` / 无扩展名二进制
+# 会被直接忽略——攻击方可以把载荷放进这些文件逃避扫描。现在按扩展名 + 魔数识别，
+# 命中即出 STR-009（medium），扫描结论至少为「需复核」。
+OPAQUE_EXTENSIONS = {
+    ".exe", ".dll", ".sys", ".com", ".msi", ".scr", ".cab", ".cpl",
+    ".so", ".dylib", ".bin", ".o", ".a",
+    ".jar", ".class", ".apk", ".dex", ".wasm", ".node",
+}
+OPAQUE_MAGIC = (b"\x7fELF", b"MZ", b"\xca\xfe\xba\xbe", b"\xcf\xfa\xed\xfe")
+# tarball 解包上限（防资源耗尽）
+MAX_TARBALL_MEMBERS = 2000
+MAX_TARBALL_MEMBER_BYTES = 50 * 1024 * 1024
+MAX_TARBALL_TOTAL_BYTES = 200 * 1024 * 1024
 # 签名数据文件：规则表是扫描器自身与家族检测技能的签名数据库，不是被测技能行为。
 # v0.3.2 收紧（旧行为 = 按文件名全局豁免，`scripts/<同名>.py` 可被随意伪造以逃避扫描）：
 #   ① 相对路径必须恰为 scripts/<规则表名>.py；
@@ -222,6 +236,57 @@ def walk_files(root, base="", trusted_tests=None, scan_root=None):
                 out.append((entry, rel))
             if len(out) >= MAX_FILES:
                 break
+    return out
+
+
+def _read_magic(path, size=4):
+    try:
+        with open(str(path), "rb") as fh:
+            return fh.read(size)
+    except OSError:
+        return b""
+
+
+def find_opaque_files(root):
+    """列出无法静态分析、但带可执行 / 二进制特征的文件（v0.4.4，fail-closed）。"""
+    out = []
+    if root.is_file():
+        candidates = [(root, root.name)]
+    else:
+        candidates = []
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            try:
+                entries = sorted(cur.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name in SKIP_DIRS:
+                    continue
+                if entry.is_dir():
+                    stack.append(entry)
+                elif entry.is_file():
+                    rel = str(entry.relative_to(root)).replace("\\", "/")
+                    candidates.append((entry, rel))
+    for path, rel in candidates:
+        name = path.name.lower()
+        if name in DOTFILE_NAMES or Path(name).suffix in TEXT_EXTENSIONS:
+            continue
+        suffix = Path(name).suffix
+        opaque = suffix in OPAQUE_EXTENSIONS
+        if not opaque:
+            magic = _read_magic(path)
+            opaque = any(magic.startswith(sig) for sig in OPAQUE_MAGIC)
+        if not opaque:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        out.append((rel, size))
+        if len(out) >= 50:
+            break
     return out
 
 
@@ -547,10 +612,15 @@ def exit_code_of(verdict):
 # ── 扫描主流程 ─────────────────────────────────────────────────────────────
 
 def _safe_extract(tf, dest):
-    """提取 tarball（Python 3.8 兼容；拒绝路径穿越、链接与特殊文件）。"""
+    """提取 tarball（Python 3.8 兼容；拒绝路径穿越、链接与特殊文件；v0.4.4 加解包上限）。"""
     safe_members = []
     root = Path(dest).resolve()
-    for member in tf.getmembers():
+    members = tf.getmembers()
+    if len(members) > MAX_TARBALL_MEMBERS:
+        raise ValueError("tarball 成员数超过上限: %d > %d"
+                         % (len(members), MAX_TARBALL_MEMBERS))
+    total_bytes = 0
+    for member in members:
         name = member.name.replace("\\", "/")
         drive_path = len(name) >= 2 and name[1] == ":" and name[0].isalpha()
         if (not name or name.startswith("/") or drive_path
@@ -558,6 +628,12 @@ def _safe_extract(tf, dest):
             raise ValueError("tarball 含危险路径: %s" % name)
         if member.issym() or member.islnk() or member.isdev() or member.isfifo():
             raise ValueError("tarball 含链接或特殊文件成员: %s" % member.name)
+        size = int(member.size or 0)
+        if size > MAX_TARBALL_MEMBER_BYTES:
+            raise ValueError("tarball 单成员过大: %s（%d 字节）" % (member.name, size))
+        total_bytes += size
+        if total_bytes > MAX_TARBALL_TOTAL_BYTES:
+            raise ValueError("tarball 解包总量超过上限: %d 字节" % total_bytes)
         parts = [part for part in name.split("/") if part not in ("", ".")]
         target = root.joinpath(*parts).resolve()
         try:
@@ -625,6 +701,13 @@ def scan_core(target, name_hint=None, auto_name_hint=False):
         name_hint = resolve_name_hint(target, root, from_archive=from_archive)
     files = walk_files(root)
     findings = scan_patterns(files)
+    # v0.4.4：不可静态分析的可执行 / 二进制载荷按 fail-closed 处理（不再静默跳过）
+    for rel, size in find_opaque_files(root):
+        findings.append(Finding(
+            "Structure", "medium", "不可扫描内容",
+            rel, 0,
+            "包内含无法静态分析的可执行 / 二进制文件（%d 字节），需人工确认来源与用途"
+            % size, 70, "STR-009"))
     check_skill_integrity(root, findings, name_hint)
     permission_summary(files, findings)
     # 检测技能文档降级（2026-08-30）：目标含检测器签名文件（audit_rules 等）→
